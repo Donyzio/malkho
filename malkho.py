@@ -90,7 +90,7 @@ SECTOR_NL: dict[str, str] = {
 }
 
 # Parameters technische indicatoren
-HISTORIE_PERIODE = "2y"        # genoeg koersgeschiedenis voor het 200-daags gemiddelde
+HISTORIE_PERIODE = "max"       # alle koersgeschiedenis (voor de grafieken 3Y, 5Y en Max)
 RSI_PERIODE = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
@@ -126,7 +126,8 @@ DASHBOARD_BESTAND = "malkho-dashboard.html"
 
 # Databestand voor de app (koersen, indicatoren, kleuren en koershistorie voor grafieken)
 DATA_BESTAND = "data.json"
-HISTORIE_DAGEN_APP = 260       # ongeveer één jaar beursdagen voor de grafieken in de app
+HISTORIE_DAGEN_APP = 400       # kalenderdagen dagkoersen voor de app (genoeg voor 1Y en YTD)
+HISTORIE_MAP = "historie"      # submap met per aandeel een bestand met koersgeschiedenis
 
 # Op GitHub zet het workflow-bestand MALKHO_UITVOER; dan komt alles in die map
 # (het dashboard als index.html, zodat het de startpagina van de website wordt).
@@ -266,12 +267,18 @@ def valuta_gelijk(info: dict, ontbrekend_ok: bool = False) -> bool:
 # =============================================================================
 
 def haal_marktdata(ticker: str) -> pd.DataFrame:
-    """Haalt slotkoersen en volume op. Kolommen: 'koers' en 'volume'."""
-    data = yf.download(ticker, period=HISTORIE_PERIODE, auto_adjust=True, progress=False)
+    """Haalt de koersgeschiedenis op. Kolommen:
+    'koers'  slotkoers gecorrigeerd voor dividend (voor de indicatoren),
+    'slot'   gewone slotkoers zoals op beurssites (voor grafieken, dag- en 12-maandscijfers),
+    'hoog' / 'laag'  hoogste en laagste koers van de dag, 'volume'."""
+    data = yf.download(ticker, period=HISTORIE_PERIODE, auto_adjust=False, progress=False)
     if data.empty:
         raise ValueError("geen koersdata gevonden")
     markt = pd.DataFrame({
-        "koers": data["Close"].squeeze(),
+        "koers": data["Adj Close"].squeeze(),
+        "slot": data["Close"].squeeze(),
+        "hoog": data["High"].squeeze(),
+        "laag": data["Low"].squeeze(),
         "volume": data["Volume"].squeeze(),
     })
     return markt.dropna(subset=["koers"])
@@ -465,14 +472,14 @@ def bereken_vastgoed(info: dict, ticker: str, koers_nu: float) -> tuple[float | 
 # =============================================================================
 
 # Slotkoersen per ticker, bewaard tijdens het ophalen; de app gebruikt ze voor de grafieken.
-KOERSHISTORIE: dict[str, pd.Series] = {}
+KOERSHISTORIE: dict[str, pd.DataFrame] = {}
 
 
 def maak_rij(naam: str, ticker: str) -> dict:
     """Verzamelt alle gegevens van één aandeel in één tabelrij."""
     markt = haal_marktdata(ticker)
     koers = markt["koers"]
-    KOERSHISTORIE[ticker] = koers
+    KOERSHISTORIE[ticker] = markt
     koers_nu = float(koers.iloc[-1])
     rsi_reeks = bereken_rsi(koers)
     rsi_nu = float(rsi_reeks.iloc[-1])
@@ -1073,30 +1080,105 @@ def maak_beweging_data(rijen_per_index: dict[str, list[dict]]) -> dict[str, list
     return beweging
 
 
-def maak_historie_data() -> dict[str, dict[str, list]]:
-    """Slotkoersen van ongeveer het laatste jaar per ticker, voor de grafieken in de app."""
-    historie = {}
-    for ticker, koers in KOERSHISTORIE.items():
-        laatste = koers.dropna().tail(HISTORIE_DAGEN_APP)
-        historie[ticker] = {
-            "datums": [d.strftime("%Y-%m-%d") for d in laatste.index],
-            "koersen": [round(float(k), 2) for k in laatste],
-        }
-    return historie
+def afgerond(waarde, decimalen: int = 2) -> float | None:
+    getal = als_getal(waarde)
+    return round(getal, decimalen) if getal is not None else None
+
+
+def bereken_koersinfo(markt: pd.DataFrame) -> dict:
+    """Slotkoers, vorige slot, dag hoog/laag, 12 maanden hoog/laag en het rendement dit jaar (YTD).
+    Op basis van de gewone koersen, zoals op beurssites."""
+    slot = markt["slot"].dropna()
+    jaar = markt.tail(HANDELSDAGEN_JAAR)
+    vorig_jaar = slot[slot.index.year < slot.index[-1].year]
+    ytd = None
+    if not vorig_jaar.empty and als_getal(vorig_jaar.iloc[-1]):
+        ytd = (float(slot.iloc[-1]) / float(vorig_jaar.iloc[-1]) - 1) * 100
+    return {
+        "slot": afgerond(slot.iloc[-1]),
+        "vorige_slot": afgerond(slot.iloc[-2]) if len(slot) > 1 else None,
+        "dag_hoog": afgerond(markt["hoog"].iloc[-1]),
+        "dag_laag": afgerond(markt["laag"].iloc[-1]),
+        "hoog_12m": afgerond(jaar["hoog"].max()),
+        "laag_12m": afgerond(jaar["laag"].min()),
+        "ytd": afgerond(ytd),
+    }
+
+
+def haal_dagverloop(ticker: str) -> pd.Series | None:
+    """Koersen van de laatste beursdag per 5 minuten (voor de grafiek 1D), in Amsterdamse tijd."""
+    try:
+        data = yf.download(ticker, period="5d", interval="5m", auto_adjust=False, progress=False)
+    except Exception as fout:  # yfinance geeft uiteenlopende fouttypen
+        log.warning("Dagverloop mislukt voor %s: %s", ticker, fout)
+        return None
+    if data.empty:
+        return None
+    koers = data["Close"].squeeze().dropna()
+    if koers.empty:
+        return None
+    if koers.index.tz is None:
+        koers.index = koers.index.tz_localize("UTC")
+    koers.index = koers.index.tz_convert("Europe/Amsterdam")
+    laatste_dag = koers.index[-1].date()
+    return koers[koers.index.date == laatste_dag]
+
+
+def reeks_naar_lijst(reeks: pd.Series, datumformaat: str) -> dict[str, list]:
+    return {"datums": [d.strftime(datumformaat) for d in reeks.index],
+            "koersen": [round(float(k), 2) for k in reeks]}
+
+
+def maak_historie_bestand(markt: pd.DataFrame, dagverloop: pd.Series | None) -> dict:
+    """Koersgeschiedenis van één aandeel voor de grafieken in de app:
+    'dag'        de laatste beursdag per 5 minuten (1D),
+    'dagelijks'  slotkoersen van ruim het laatste jaar (1W tot en met 1Y en YTD),
+    'wekelijks'  de laatste slotkoers van elke week, over de hele geschiedenis (3Y, 5Y, Max)."""
+    slot = markt["slot"].dropna()
+    dagelijks = slot[slot.index >= slot.index[-1] - pd.DateOffset(days=HISTORIE_DAGEN_APP)]
+    wekelijks = slot.groupby(slot.index.to_period("W-FRI")).tail(1)
+    return {
+        "dag": reeks_naar_lijst(dagverloop, "%H:%M") if dagverloop is not None else None,
+        "dagelijks": reeks_naar_lijst(dagelijks, "%Y-%m-%d"),
+        "wekelijks": reeks_naar_lijst(wekelijks, "%Y-%m-%d"),
+    }
+
+
+def historie_bestandsnaam(ticker: str) -> str:
+    """Veilige bestandsnaam voor een ticker; de app gebruikt dezelfde regel."""
+    import re
+    return re.sub(r"[^A-Za-z0-9.\-]", "_", ticker) + ".json"
 
 
 def maak_app_data(rijen_per_index: dict[str, list[dict]]) -> dict:
-    """Alles wat de app nodig heeft, in één databestand."""
+    """Alles wat de app op het eerste scherm nodig heeft, in één databestand.
+    De koersgeschiedenis per aandeel staat in aparte bestanden in de map 'historie'."""
     return {
-        "versie": 1,
+        "versie": 2,
         "bijgewerkt": pd.Timestamp.now(tz="Europe/Amsterdam").isoformat(timespec="minutes"),
         "kolommen": {"technisch": TECHNISCH, "fundamenteel": FUNDAMENTEEL},
         "signalen": bepaal_signalen(rijen_per_index),
         "beweging": maak_beweging_data(rijen_per_index),
         "indices": {naam: maak_index_data(rijen) for naam, rijen in rijen_per_index.items() if rijen},
-        "historie": maak_historie_data(),
+        "koersinfo": {ticker: bereken_koersinfo(markt) for ticker, markt in KOERSHISTORIE.items()},
         "toelichting": TOELICHTING.strip(),
     }
+
+
+def bewaar_historie(map_pad: str) -> int:
+    """Schrijft per aandeel een historiebestand. Geeft het aantal geschreven bestanden terug."""
+    historie_map = os.path.join(map_pad, HISTORIE_MAP)
+    aantal = 0
+    for ticker, markt in KOERSHISTORIE.items():
+        try:
+            inhoud = maak_historie_bestand(markt, haal_dagverloop(ticker))
+            schrijf_bestand(historie_map, historie_bestandsnaam(ticker),
+                            json.dumps(inhoud, separators=(",", ":")))
+            aantal += 1
+        except Exception as fout:  # één aandeel mag de rest niet blokkeren
+            log.warning("Historie opslaan mislukt voor %s: %s", ticker, fout)
+        time.sleep(PAUZE_TUSSEN_AANVRAGEN)
+    return aantal
 
 
 # =============================================================================
@@ -1144,6 +1226,10 @@ def bewaar_uitvoer(rijen_per_index: dict[str, list[dict]]) -> list[str]:
             paden.append(schrijf_bestand(map_pad, naam, maak()))
         except Exception as fout:  # het ene bestand mag het andere niet blokkeren
             log.warning("%s opslaan mislukt: %s", naam, fout)
+
+    aantal = bewaar_historie(map_pad)
+    if not IN_NOTEBOOK:
+        print(f"Koersgeschiedenis opgeslagen voor {aantal} aandelen.")
 
     if downloaden and paden:
         from google.colab import files
