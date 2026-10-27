@@ -1,0 +1,51 @@
+# Draait het MalKho-script elke beursdag en zet het dashboard en data.json op GitHub Pages.
+name: MalKho dagelijks
+
+on:
+  schedule:
+    # Tijden zijn in UTC: 17:00 UTC = 18:00 (wintertijd) of 19:00 (zomertijd) in Amsterdam,
+    # dus na het sluiten van Euronext om 17:30. Maandag t/m vrijdag.
+    - cron: "0 17 * * 1-5"
+  workflow_dispatch:  # knop "Run workflow" om het zelf te starten
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: malkho
+  cancel-in-progress: true
+
+jobs:
+  bijwerken:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.publiceren.outputs.page_url }}
+    steps:
+      - name: Code ophalen
+        uses: actions/checkout@v4
+
+      - name: Python installeren
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Pakketten installeren
+        run: pip install -r requirements.txt
+
+      - name: MalKho draaien
+        env:
+          MALKHO_UITVOER: site
+        run: python malkho.py
+
+      - name: Website klaarzetten
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Publiceren op GitHub Pages
+        id: publiceren
+        uses: actions/deploy-pages@v4
