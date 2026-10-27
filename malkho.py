@@ -1,5 +1,8 @@
 """MalKho: overzicht van aandelen met technische en fundamentele indicatoren.
 
+Versie 1.3 (27-10-2026, zonder backtest)
+  - waardering t.o.v. de eigen geschiedenis: K/W, koers/boekwaarde, EV/EBITDA en
+    dividendrendement vergeleken met eerdere jaren; kolom "Waardering hist."
 Versie 1.1 (27-10-2026)
   - grafieken in de app: YTD, 1D, 1W, 1M, 3M, 6M, 1Y, 3Y, 5Y en Max
   - koersblok in de app: slotkoers, dag hoog/laag, 12 maanden hoog/laag, YTD
@@ -7,7 +10,7 @@ Versie 1.0 (27-10-2026)
   - draait ook op GitHub en maakt het dashboard en data.json voor de app
 """
 
-MALKHO_VERSIE = "1.1"
+MALKHO_VERSIE = "1.3"
 MALKHO_DATUM = "27-10-2026"
 
 import json
@@ -18,6 +21,7 @@ import sys
 import time
 from typing import NamedTuple
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -143,6 +147,13 @@ HISTORIE_MAP = "historie"      # submap met per aandeel een bestand met koersges
 # (het dashboard als index.html, zodat het de startpagina van de website wordt).
 UITVOER_MAP = os.environ.get("MALKHO_UITVOER")
 
+# Waardering t.o.v. de eigen geschiedenis
+WAARDERING_MAKEN = True
+WAARDERING_VERTRAGING = 90        # jaarcijfers gelden pas zoveel dagen na het boekjaareinde als bekend
+WAARDERING_JAREN_DIVIDEND = 10    # dividendrendement vergelijken met de laatste 10 jaar
+WAARDERING_MIN_DAGEN = 500        # minstens ongeveer 2 jaar geschiedenis nodig
+WAARDERING_GOEDKOOP = 80          # goedkoopte-score 80+ = goedkoop, 20 of lager = duur
+
 
 class Drempels(NamedTuple):
     """Kleurgrenzen in procenten. Waarden tussen de zones blijven ongekleurd."""
@@ -207,6 +218,7 @@ KOL_ROE = "ROE (%)"
 KOL_FCF = "FCF-rendement (%)"
 KOL_SCHULD = "Netto schuld/EBITDA"
 KOL_DIVIDEND = "Dividend (%)"
+KOL_WAARDERING = "Waardering hist."
 
 NUMERIEKE_KOLOMMEN = [KOL_KOERS, KOL_DAGVERSCHIL, KOL_RSI, KOL_SMA, KOL_BOLLINGER, KOL_VOLUME,
                       KOL_HOOG, KOL_KW, KOL_KW_VERWACHT, KOL_AFFO, KOL_NAV, KOL_EBITDA, KOL_ROE, KOL_FCF,
@@ -216,7 +228,7 @@ NUMERIEKE_KOLOMMEN = [KOL_KOERS, KOL_DAGVERSCHIL, KOL_RSI, KOL_SMA, KOL_BOLLINGE
 TECHNISCH = [KOL_KOERS, KOL_DAGVERSCHIL, KOL_RSI, KOL_GEM_RSI, KOL_SIGNAAL, KOL_OMKEER,
              KOL_SMA, KOL_MACD, KOL_BOLLINGER, KOL_VOLUME, KOL_HOOG, KOL_INSTAP]
 FUNDAMENTEEL = [KOL_KW, KOL_KW_VERWACHT, KOL_GEM_KW, KOL_AFFO, KOL_NAV, KOL_BRON,
-                KOL_EBITDA, KOL_ROE, KOL_FCF, KOL_SCHULD, KOL_DIVIDEND]
+                KOL_EBITDA, KOL_ROE, KOL_FCF, KOL_SCHULD, KOL_DIVIDEND, KOL_WAARDERING]
 GROEP_TECHNISCH = "Technisch"
 GROEP_FUNDAMENTEEL = "Fundamenteel"
 
@@ -248,6 +260,7 @@ TOELICHTING = """
 - **FCF-rendement (%)**: vrije kasstroom gedeeld door de beurswaarde. Hoger is aantrekkelijker; de kleur hangt af van de branche.
 - **Netto schuld/EBITDA**: in hoeveel jaar de netto schuld uit de EBITDA terugbetaald kan worden. Boven ongeveer 3 à 4 wordt vaak als hoog gezien; negatief betekent meer kas dan schuld.
 - **Dividend (%)**: verwacht jaardividend als percentage van de koers (bruto, vóór dividendbelasting).
+- **Waardering hist.**: is het aandeel nu goedkoop of duur vergeleken met de eigen geschiedenis? Per branche worden de kengetallen gebruikt die daar passen (bijv. koers/boekwaarde bij banken, EV/EBITDA bij energie). *Goedkoop* (groen) als het aandeel goedkoper is dan in ongeveer 80% van de gemeten periode, *duur* (rood) als het duurder is. Jaarcijfers van Yahoo gaan zo'n 4 à 5 jaar terug, het dividendrendement 10 jaar. Let op: bij cyclische bedrijven kan "goedkoop" ook betekenen dat de winst op een piek staat.
 """
 
 
@@ -478,6 +491,219 @@ def bereken_vastgoed(info: dict, ticker: str, koers_nu: float) -> tuple[float | 
 
 
 # =============================================================================
+# 4b. WAARDERING TEN OPZICHTE VAN DE EIGEN GESCHIEDENIS
+# =============================================================================
+#
+# Voor elke beursdag in het verleden: koers gedeeld door de jaarcijfers die op die dag al bekend
+# waren. Zo ontstaat per aandeel een reeks K/W, koers/boekwaarde, EV/EBITDA en dividendrendement.
+# Daarna kijken we waar de huidige waarde in die reeks valt (het percentiel).
+
+# Welke kengetallen passen bij welke branche (de eerste is de belangrijkste)
+KG_KW = "K/W"
+KG_KB = "Koers/boekwaarde"
+KG_EV = "EV/EBITDA"
+KG_DIV = "Dividendrendement (%)"
+
+WAARDERING_PER_BRANCHE: dict[str, list[str]] = {
+    "Financiële diensten": [KG_KB, KG_DIV],
+    "Vastgoed": [KG_DIV, KG_KB],
+    "Energie": [KG_EV, KG_KB],
+    "Basismaterialen": [KG_EV, KG_KB],
+    "Industrie": [KG_EV, KG_KW],
+}
+WAARDERING_STANDAARD = [KG_KW, KG_EV]
+
+
+def kies_waarderingskengetallen(branche: str, ticker: str) -> list[str]:
+    kengetallen = WAARDERING_PER_BRANCHE.get(branche, WAARDERING_STANDAARD)
+    if ticker in GEEN_EBITDA:  # banken en verzekeraars: EV/EBITDA zegt niets
+        kengetallen = [k for k in kengetallen if k != KG_EV] or [KG_KB, KG_DIV]
+    return kengetallen
+
+
+def zoek_regel(tabel: pd.DataFrame | None, namen: list[str]) -> pd.Series | None:
+    """Eerste regel uit een jaarcijfertabel van Yahoo die bestaat en waarden heeft."""
+    if tabel is None or tabel.empty:
+        return None
+    for naam in namen:
+        if naam in tabel.index:
+            regel = pd.to_numeric(tabel.loc[naam], errors="coerce").dropna()
+            if not regel.empty:
+                regel.index = pd.to_datetime(regel.index).tz_localize(None)
+                return regel.sort_index()
+    return None
+
+
+def per_dag(jaarwaarden: pd.Series | None, dagen: pd.DatetimeIndex) -> pd.Series:
+    """Zet jaarcijfers om naar een dagelijkse reeks: elke dag geldt het laatst gepubliceerde jaar.
+    Jaarcijfers worden pas WAARDERING_VERTRAGING dagen na het boekjaareinde als bekend beschouwd."""
+    if jaarwaarden is None or jaarwaarden.empty:
+        return pd.Series(np.nan, index=dagen)
+    bekend = jaarwaarden.copy()
+    bekend.index = bekend.index + pd.Timedelta(days=WAARDERING_VERTRAGING)
+    bekend = bekend[~bekend.index.duplicated(keep="last")].sort_index()
+    return bekend.reindex(bekend.index.union(dagen)).ffill().reindex(dagen)
+
+
+_WISSELKOERSEN: dict[str, pd.Series | None] = {}
+
+
+def wisselkoers(van: str, naar: str, dagen: pd.DatetimeIndex) -> pd.Series | None:
+    """Wisselkoers per dag (1 'van' = x 'naar'), bijv. USD naar EUR voor Shell."""
+    if van == naar:
+        return pd.Series(1.0, index=dagen)
+    paar = f"{van}{naar}=X"
+    if paar not in _WISSELKOERSEN:
+        try:
+            data = yf.download(paar, period="max", auto_adjust=False, progress=False)
+            reeks = data["Close"].squeeze().dropna() if not data.empty else None
+            if reeks is not None:
+                reeks.index = pd.to_datetime(reeks.index).tz_localize(None)
+            _WISSELKOERSEN[paar] = reeks
+        except Exception as fout:  # yfinance geeft uiteenlopende fouttypen
+            log.warning("Wisselkoers %s mislukt: %s", paar, fout)
+            _WISSELKOERSEN[paar] = None
+    reeks = _WISSELKOERSEN[paar]
+    if reeks is None or reeks.empty:
+        return None
+    return reeks.reindex(reeks.index.union(dagen)).ffill().reindex(dagen)
+
+
+def bereken_waarderingsreeksen(aandeel, markt: pd.DataFrame, info: dict) -> dict[str, pd.Series]:
+    """Dagelijkse reeksen van K/W, koers/boekwaarde, EV/EBITDA en dividendrendement."""
+    slot = markt["slot"].dropna()
+    slot.index = pd.to_datetime(slot.index).tz_localize(None)
+    dagen = slot.index
+    reeksen: dict[str, pd.Series] = {}
+
+    # Dividendrendement: dividenden van de afgelopen 12 maanden gedeeld door de koers.
+    # Dividenden staan bij Yahoo in de handelsvaluta, dus geen omrekening nodig.
+    try:
+        dividenden = aandeel.dividends
+    except Exception:  # yfinance geeft uiteenlopende fouttypen
+        dividenden = None
+    if dividenden is not None and len(dividenden) > 0:
+        dividenden = dividenden.copy()
+        dividenden.index = pd.to_datetime(dividenden.index).tz_localize(None).normalize()
+        per_dag_uitgekeerd = dividenden.groupby(level=0).sum()
+        dagelijks = per_dag_uitgekeerd.reindex(per_dag_uitgekeerd.index.union(dagen), fill_value=0)
+        twaalf_maanden = dagelijks.rolling("365D").sum().reindex(dagen)
+        rendement = twaalf_maanden / slot * 100
+        # pas meten vanaf een jaar na het eerste dividend, anders is het 12-maandstotaal te laag
+        rendement[dagen < per_dag_uitgekeerd.index.min() + pd.Timedelta(days=365)] = np.nan
+        reeksen[KG_DIV] = rendement
+
+    # Kengetallen op basis van jaarcijfers (rapportagevaluta, zo nodig omgerekend)
+    try:
+        winst_tabel, balans = aandeel.income_stmt, aandeel.balance_sheet
+    except Exception as fout:  # yfinance geeft uiteenlopende fouttypen
+        log.warning("Jaarcijfers mislukt: %s", fout)
+        return reeksen
+
+    rapportage, handel = info.get("financialCurrency"), info.get("currency")
+    if not rapportage or not handel:
+        return reeksen
+    omrekening = wisselkoers(rapportage, handel, dagen)
+    if omrekening is None:
+        log.warning("Geen wisselkoers %s naar %s: alleen dividendrendement.", rapportage, handel)
+        return reeksen
+
+    aandelen = zoek_regel(balans, ["Ordinary Shares Number", "Share Issued"])
+    if aandelen is None:
+        aandelen = zoek_regel(winst_tabel, ["Diluted Average Shares", "Basic Average Shares"])
+    winst_per_aandeel = zoek_regel(winst_tabel, ["Diluted EPS", "Basic EPS"])
+    if winst_per_aandeel is None:
+        nettowinst = zoek_regel(winst_tabel, ["Net Income Common Stockholders", "Net Income"])
+        if nettowinst is not None and aandelen is not None:
+            winst_per_aandeel = (nettowinst / aandelen.reindex(nettowinst.index)).dropna()
+    eigen_vermogen = zoek_regel(balans, ["Common Stock Equity", "Stockholders Equity"])
+    ebitda = zoek_regel(winst_tabel, ["EBITDA", "Normalized EBITDA"])
+    schuld = zoek_regel(balans, ["Total Debt"])
+    kas = zoek_regel(balans, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])
+
+    aandelen_d = per_dag(aandelen, dagen)
+
+    wpa = per_dag(winst_per_aandeel, dagen) * omrekening
+    reeksen[KG_KW] = (slot / wpa).where(wpa > 0)  # geen K/W bij verlies
+
+    if eigen_vermogen is not None:
+        boekwaarde = per_dag(eigen_vermogen, dagen) * omrekening / aandelen_d
+        reeksen[KG_KB] = (slot / boekwaarde).where(boekwaarde > 0)
+
+    if ebitda is not None:
+        netto_schuld = (per_dag(schuld, dagen).fillna(0) - per_dag(kas, dagen).fillna(0)) * omrekening
+        ondernemingswaarde = slot * aandelen_d + netto_schuld
+        ebitda_d = per_dag(ebitda, dagen) * omrekening
+        reeksen[KG_EV] = (ondernemingswaarde / ebitda_d).where(ebitda_d > 0)
+
+    return reeksen
+
+
+def vat_reeks_samen(reeks: pd.Series, hoog_is_goedkoop: bool, laatste_dag: pd.Timestamp) -> dict | None:
+    """Huidige waarde, gemiddelde, uitersten en percentiel binnen de eigen geschiedenis.
+    Geen uitkomst als er vandaag geen waarde is (bijv. verlies, dus geen K/W) of te weinig geschiedenis."""
+    reeks = reeks.replace([np.inf, -np.inf], np.nan).dropna()
+    if reeks.empty or reeks.index[-1] < laatste_dag or len(reeks) < WAARDERING_MIN_DAGEN:
+        return None
+    if hoog_is_goedkoop:  # dividendrendement: alleen de laatste jaren
+        reeks = reeks[reeks.index >= reeks.index[-1] - pd.DateOffset(years=WAARDERING_JAREN_DIVIDEND)]
+    nu = float(reeks.iloc[-1])
+    # gelijke waarden tellen voor de helft, zodat een vlakke reeks op 50 uitkomt en niet op 0
+    percentiel = float(((reeks < nu).mean() + 0.5 * (reeks == nu).mean()) * 100)
+    goedkoopte = percentiel if hoog_is_goedkoop else 100 - percentiel
+    gemiddelde = float(reeks.mean())
+    return {
+        "nu": round(nu, 2),
+        "gem": round(gemiddelde, 2),
+        "mediaan": round(float(reeks.median()), 2),
+        "min": round(float(reeks.min()), 2),
+        "max": round(float(reeks.max()), 2),
+        "verschil_gem": round((nu / gemiddelde - 1) * 100, 1) if gemiddelde else None,
+        "percentiel": round(percentiel),
+        "goedkoopte": round(goedkoopte),
+        "oordeel": oordeel(goedkoopte),
+        "hoog_is_goedkoop": hoog_is_goedkoop,
+        "sinds": reeks.index[0].strftime("%Y-%m-%d"),
+    }
+
+
+def oordeel(goedkoopte: float | None) -> str | None:
+    if goedkoopte is None:
+        return None
+    if goedkoopte >= WAARDERING_GOEDKOOP:
+        return "goedkoop"
+    if goedkoopte <= 100 - WAARDERING_GOEDKOOP:
+        return "duur"
+    return "normaal"
+
+
+def bereken_waardering(aandeel, markt: pd.DataFrame, info: dict, branche: str, ticker: str) -> dict | None:
+    """Waardering t.o.v. de eigen geschiedenis: per kengetal en een totaaloordeel voor de branche."""
+    reeksen = bereken_waarderingsreeksen(aandeel, markt, info)
+    laatste_dag = pd.to_datetime(markt["slot"].dropna().index[-1]).tz_localize(None)
+    if branche == "Vastgoed" or ticker in GEEN_EBITDA:
+        reeksen.pop(KG_EV, None)
+    if branche == "Vastgoed":
+        reeksen.pop(KG_KW, None)  # bij vastgoed zegt de K/W weinig
+    kengetallen = {}
+    for naam, reeks in reeksen.items():
+        samenvatting = vat_reeks_samen(reeks, hoog_is_goedkoop=(naam == KG_DIV), laatste_dag=laatste_dag)
+        if samenvatting:
+            kengetallen[naam] = samenvatting
+    if not kengetallen:
+        return None
+
+    passend = [k for k in kies_waarderingskengetallen(branche, ticker) if k in kengetallen]
+    basis = passend or list(kengetallen)
+    score = round(sum(kengetallen[k]["goedkoopte"] for k in basis) / len(basis))
+    return {"oordeel": oordeel(score), "score": score, "basis": basis, "kengetallen": kengetallen}
+
+
+# Resultaten per ticker (voor data.json); de tabel krijgt alleen het oordeel
+WAARDERING: dict[str, dict] = {}
+
+
+# =============================================================================
 # 5. TABEL OPBOUWEN
 # =============================================================================
 
@@ -497,7 +723,8 @@ def maak_rij(naam: str, ticker: str) -> dict:
     afstand_sma = bereken_afstand_sma(koers)
     rel_volume = bereken_relatief_volume(markt["volume"])
 
-    info = yf.Ticker(ticker).info
+    aandeel = yf.Ticker(ticker)
+    info = aandeel.info
     sector_en = info.get("sector", "Onbekend")
     is_vastgoed = sector_en == "Real Estate" or ticker in HANDMATIGE_CIJFERS
     branche = "Vastgoed" if is_vastgoed else SECTOR_NL.get(sector_en, sector_en)
@@ -533,7 +760,23 @@ def maak_rij(naam: str, ticker: str) -> dict:
         KOL_BRON: bron,
         **bereken_kengetallen(info, ticker),
         KOL_DIVIDEND: bereken_dividendrendement(info, koers_nu),
+        KOL_WAARDERING: waardering_voor_tabel(aandeel, markt, info, branche, ticker),
     }
+
+
+def waardering_voor_tabel(aandeel, markt: pd.DataFrame, info: dict, branche: str, ticker: str) -> str | None:
+    """Berekent de waardering t.o.v. de eigen geschiedenis; bewaart de details voor de app."""
+    if not WAARDERING_MAKEN:
+        return None
+    try:
+        resultaat = bereken_waardering(aandeel, markt, info, branche, ticker)
+    except Exception as fout:  # een fout hier mag de rest van de rij niet blokkeren
+        log.warning("Waardering mislukt voor %s: %s", ticker, fout)
+        return None
+    if not resultaat:
+        return None
+    WAARDERING[ticker] = resultaat
+    return resultaat["oordeel"]
 
 
 def verzamel_rijen(tickers: dict[str, str]) -> list[dict]:
@@ -675,6 +918,10 @@ def kleur_nav(waarde: float) -> str:
     return GROEN if waarde < 0 else ROOD
 
 
+def kleur_waardering(waarde: str) -> str:
+    return {"goedkoop": GROEN, "duur": ROOD}.get(waarde, "")
+
+
 def kleur_kw(rij: pd.Series) -> pd.Series:
     """K/W lager dan het branchegemiddelde is groen, hoger is rood."""
     stijlen = pd.Series("", index=rij.index)
@@ -723,6 +970,7 @@ def bouw_stijlen(tabel: pd.DataFrame) -> pd.DataFrame:
         KOL_HOOG: kleur_hoog,
         KOL_INSTAP: kleur_instap,
         KOL_NAV: kleur_nav,
+        KOL_WAARDERING: kleur_waardering,
     }
     for kolom, regel in kolom_regels.items():
         stijlen[kolom] = tabel[kolom].map(regel)
@@ -1172,6 +1420,7 @@ def maak_app_data(rijen_per_index: dict[str, list[dict]]) -> dict:
         "beweging": maak_beweging_data(rijen_per_index),
         "indices": {naam: maak_index_data(rijen) for naam, rijen in rijen_per_index.items() if rijen},
         "koersinfo": {ticker: bereken_koersinfo(markt) for ticker, markt in KOERSHISTORIE.items()},
+        "waardering": WAARDERING,
         "toelichting": TOELICHTING.strip(),
     }
 
