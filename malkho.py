@@ -1,4 +1,14 @@
-"""MalKho: overzicht van aandelen met technische en fundamentele indicatoren."""
+"""MalKho: overzicht van aandelen met technische en fundamentele indicatoren.
+
+Versie 1.1 (27-10-2026)
+  - grafieken in de app: YTD, 1D, 1W, 1M, 3M, 6M, 1Y, 3Y, 5Y en Max
+  - koersblok in de app: slotkoers, dag hoog/laag, 12 maanden hoog/laag, YTD
+Versie 1.0 (27-10-2026)
+  - draait ook op GitHub en maakt het dashboard en data.json voor de app
+"""
+
+MALKHO_VERSIE = "1.1"
+MALKHO_DATUM = "27-10-2026"
 
 import json
 import logging
@@ -1007,7 +1017,7 @@ def maak_dashboard_html(rijen_per_index: dict[str, list[dict]]) -> str:
 <header><h1>MalKho</h1><div class="sub">Bijgewerkt {tijd} · koersen van Yahoo Finance (slotkoers of 15 min vertraagd)</div></header>
 <nav>{knoppen}</nav>
 <main>{"".join(secties)}</main>
-<footer>Geen beleggingsadvies. Cijfers van Yahoo Finance kunnen afwijken van andere bronnen.</footer>
+<footer>MalKho-script versie {MALKHO_VERSIE} ({MALKHO_DATUM}) · Geen beleggingsadvies. Cijfers van Yahoo Finance kunnen afwijken van andere bronnen.</footer>
 <script>{DASHBOARD_JS}</script>
 </body></html>"""
 
@@ -1155,6 +1165,7 @@ def maak_app_data(rijen_per_index: dict[str, list[dict]]) -> dict:
     De koersgeschiedenis per aandeel staat in aparte bestanden in de map 'historie'."""
     return {
         "versie": 2,
+        "script_versie": f"{MALKHO_VERSIE} ({MALKHO_DATUM})",
         "bijgewerkt": pd.Timestamp.now(tz="Europe/Amsterdam").isoformat(timespec="minutes"),
         "kolommen": {"technisch": TECHNISCH, "fundamenteel": FUNDAMENTEEL},
         "signalen": bepaal_signalen(rijen_per_index),
@@ -1245,6 +1256,7 @@ def bewaar_uitvoer(rijen_per_index: dict[str, list[dict]]) -> list[str]:
 # =============================================================================
 
 def main() -> int:
+    print(f"MalKho-script versie {MALKHO_VERSIE} ({MALKHO_DATUM})")
     # Plek helemaal bovenaan reserveren; de tabel komt hier te staan zodra de data binnen is
     koers_plek = display(
         Markdown("## Koersen en dagverschil\n\n*De gegevens worden opgehaald...*"),
