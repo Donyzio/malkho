@@ -1,21 +1,35 @@
-# Draait het MalKho-script elke beursdag en zet het dashboard en data.json op GitHub Pages.
+# MalKho: draait het script en zet het dashboard en de gegevens voor de app op GitHub Pages.
+# Versie 1.4 (27-10-2026)
+#  - volledige run: 1x per werkdag na sluiting van de beurs (alles opnieuw berekenen)
+#  - lichte run: elk uur tijdens de beurs (alleen de koersen bijwerken)
 name: MalKho dagelijks
 
 on:
   schedule:
-    # Tijden zijn in UTC: 17:00 UTC = 18:00 (wintertijd) of 19:00 (zomertijd) in Amsterdam,
-    # dus na het sluiten van Euronext om 17:30. Maandag t/m vrijdag.
+    # Tijden zijn in UTC. Amsterdam = UTC+1 (wintertijd) of UTC+2 (zomertijd).
+    # Volledige run: 17:00 UTC = 18:00 (winter) of 19:00 (zomer), na sluiting om 17:30.
     - cron: "0 17 * * 1-5"
+    # Lichte run: elk uur van 08:00 tot en met 16:00 UTC
+    # = 09:00–17:00 (winter) of 10:00–18:00 (zomer).
+    - cron: "0 8-16 * * 1-5"
   workflow_dispatch:  # knop "Run workflow" om het zelf te starten
+    inputs:
+      modus:
+        description: "Welke run?"
+        type: choice
+        options: [volledig, licht]
+        default: volledig
 
 permissions:
   contents: read
   pages: write
   id-token: write
 
+# Runs wachten op elkaar in plaats van elkaar af te breken
+# (anders kan een vertraagde lichte run de volledige run stoppen).
 concurrency:
   group: malkho
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   bijwerken:
@@ -39,6 +53,9 @@ jobs:
       - name: MalKho draaien
         env:
           MALKHO_UITVOER: site
+          # lichte run bij het uurschema, anders de keuze bij "Run workflow" (standaard volledig)
+          MALKHO_MODUS: ${{ github.event.schedule == '0 8-16 * * 1-5' && 'licht' || inputs.modus || 'volledig' }}
+          MALKHO_SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
         run: python malkho.py
 
       - name: Website klaarzetten
