@@ -1,5 +1,10 @@
 """MalKho: overzicht van aandelen met technische en fundamentele indicatoren.
 
+Versie 1.5 (27-10-2026, zonder backtest)
+  - jaarcijfers één keer per week per aandeel ophalen (verdeeld over de week), tussendoor
+    uit cache/jaarcijfers.json: minder verzoeken naar Yahoo
+Versie 1.4 (27-10-2026, zonder backtest)
+  - lichte run: elk uur tijdens de beurs alleen de koersen bijwerken (MALKHO_MODUS=licht)
 Versie 1.3 (27-10-2026, zonder backtest)
   - waardering t.o.v. de eigen geschiedenis: K/W, koers/boekwaarde, EV/EBITDA en
     dividendrendement vergeleken met eerdere jaren; kolom "Waardering hist."
@@ -10,7 +15,7 @@ Versie 1.0 (27-10-2026)
   - draait ook op GitHub en maakt het dashboard en data.json voor de app
 """
 
-MALKHO_VERSIE = "1.3"
+MALKHO_VERSIE = "1.5"
 MALKHO_DATUM = "27-10-2026"
 
 import json
@@ -147,12 +152,19 @@ HISTORIE_MAP = "historie"      # submap met per aandeel een bestand met koersges
 # (het dashboard als index.html, zodat het de startpagina van de website wordt).
 UITVOER_MAP = os.environ.get("MALKHO_UITVOER")
 
+# Volledige run (alles, 1x per dag) of lichte run (alleen koersen, elk uur tijdens de beurs)
+MODUS = os.environ.get("MALKHO_MODUS", "volledig")
+SITE_URL = os.environ.get("MALKHO_SITE_URL", "")   # je eigen website, voor de lichte run
+LICHT_PAUZE = 0.3                                   # seconden tussen de koersverzoeken
+
 # Waardering t.o.v. de eigen geschiedenis
 WAARDERING_MAKEN = True
 WAARDERING_VERTRAGING = 90        # jaarcijfers gelden pas zoveel dagen na het boekjaareinde als bekend
 WAARDERING_JAREN_DIVIDEND = 10    # dividendrendement vergelijken met de laatste 10 jaar
 WAARDERING_MIN_DAGEN = 500        # minstens ongeveer 2 jaar geschiedenis nodig
 WAARDERING_GOEDKOOP = 80          # goedkoopte-score 80+ = goedkoop, 20 of lager = duur
+JAARCIJFERS_DAGEN = 7             # jaarcijfers per aandeel één keer per zoveel dagen bij Yahoo ophalen
+CACHE_BESTAND = "cache/jaarcijfers.json"
 
 
 class Drempels(NamedTuple):
@@ -569,6 +581,95 @@ def wisselkoers(van: str, naar: str, dagen: pd.DatetimeIndex) -> pd.Series | Non
     return reeks.reindex(reeks.index.union(dagen)).ffill().reindex(dagen)
 
 
+# ---------- jaarcijfers: één keer per week ophalen (tussendoor uit een opgeslagen kopie) ----------
+#
+# Jaarcijfers veranderen maar een paar keer per jaar. Daarom bewaart het script ze in
+# cache/jaarcijfers.json (op je website of in je Drive-map) en vraagt het ze per aandeel pas
+# opnieuw bij Yahoo op als de kopie een week oud is. De aandelen zijn over de week verdeeld,
+# zodat er elke dag maar een paar ververst worden.
+
+WINST_REGELS = ["Diluted EPS", "Basic EPS", "Net Income Common Stockholders", "Net Income",
+                "EBITDA", "Normalized EBITDA", "Diluted Average Shares", "Basic Average Shares"]
+BALANS_REGELS = ["Ordinary Shares Number", "Share Issued", "Common Stock Equity", "Stockholders Equity",
+                 "Total Debt", "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"]
+
+_JAARCIJFERS_CACHE: dict | None = None
+_JAARCIJFERS_STAND = {"uit_cache": 0, "opgehaald": 0}
+
+
+def laad_jaarcijfers_cache() -> dict:
+    """Leest de opgeslagen jaarcijfers: eerst uit een lokale map (Colab/Drive), anders van je website."""
+    global _JAARCIJFERS_CACHE
+    if _JAARCIJFERS_CACHE is not None:
+        return _JAARCIJFERS_CACHE
+    _JAARCIJFERS_CACHE = {}
+    for map_pad in (UITVOER_MAP, DASHBOARD_MAP_DRIVE, DASHBOARD_MAP_LOKAAL):
+        pad = os.path.join(map_pad, CACHE_BESTAND) if map_pad else None
+        if pad and os.path.isfile(pad):
+            try:
+                with open(pad, encoding="utf-8") as bestand:
+                    _JAARCIJFERS_CACHE = json.load(bestand)
+                return _JAARCIJFERS_CACHE
+            except Exception as fout:
+                log.warning("Opgeslagen jaarcijfers onleesbaar (%s); ze worden opnieuw opgehaald.", fout)
+    if SITE_URL:
+        try:
+            _JAARCIJFERS_CACHE = json.loads(haal_site_bestand(CACHE_BESTAND))
+        except Exception:
+            pass  # nog geen opgeslagen jaarcijfers (eerste keer): alles wordt opgehaald
+    return _JAARCIJFERS_CACHE
+
+
+def tabel_naar_dict(tabel: pd.DataFrame | None, regels: list[str]) -> dict:
+    """Alleen de regels die het script gebruikt, als {regel: {datum: waarde}}."""
+    if tabel is None or tabel.empty:
+        return {}
+    uitkomst = {}
+    for regel in regels:
+        if regel in tabel.index:
+            waarden = pd.to_numeric(tabel.loc[regel], errors="coerce").dropna()
+            uitkomst[regel] = {pd.Timestamp(d).strftime("%Y-%m-%d"): float(w) for d, w in waarden.items()}
+    return uitkomst
+
+
+def dict_naar_tabel(gegevens: dict) -> pd.DataFrame:
+    return pd.DataFrame.from_dict(gegevens, orient="index") if gegevens else pd.DataFrame()
+
+
+def verversdag_verschuiving(ticker: str) -> int:
+    """Vaste verschuiving van 0 t/m 6 dagen per aandeel, zodat de aandelen over de week verdeeld zijn."""
+    return sum(ord(teken) for teken in ticker) % JAARCIJFERS_DAGEN
+
+
+def jaarcijfers(aandeel, ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Winst- en verliesrekening en balans; uit de opgeslagen kopie als die minder dan een week oud is."""
+    cache = laad_jaarcijfers_cache()
+    vandaag = pd.Timestamp.now(tz="Europe/Amsterdam").normalize().tz_localize(None)
+    opgeslagen = cache.get(ticker)
+    if opgeslagen and opgeslagen.get("verversen_na") and pd.Timestamp(opgeslagen["verversen_na"]) > vandaag:
+        _JAARCIJFERS_STAND["uit_cache"] += 1
+        return dict_naar_tabel(opgeslagen["winst"]), dict_naar_tabel(opgeslagen["balans"])
+
+    winst_tabel, balans = aandeel.income_stmt, aandeel.balance_sheet
+    _JAARCIJFERS_STAND["opgehaald"] += 1
+    winst, bal = tabel_naar_dict(winst_tabel, WINST_REGELS), tabel_naar_dict(balans, BALANS_REGELS)
+    if winst or bal:  # alleen bewaren als Yahoo echt iets teruggaf
+        dagen = JAARCIJFERS_DAGEN if opgeslagen else JAARCIJFERS_DAGEN - verversdag_verschuiving(ticker)
+        cache[ticker] = {
+            "opgehaald": vandaag.strftime("%Y-%m-%d"),
+            "verversen_na": (vandaag + pd.Timedelta(days=dagen)).strftime("%Y-%m-%d"),
+            "winst": winst,
+            "balans": bal,
+        }
+    return dict_naar_tabel(winst), dict_naar_tabel(bal)
+
+
+def bewaar_jaarcijfers_cache(map_pad: str) -> None:
+    if _JAARCIJFERS_CACHE:
+        schrijf_bestand(os.path.dirname(os.path.join(map_pad, CACHE_BESTAND)), os.path.basename(CACHE_BESTAND),
+                        json.dumps(_JAARCIJFERS_CACHE, separators=(",", ":")))
+
+
 def bereken_waarderingsreeksen(aandeel, markt: pd.DataFrame, info: dict) -> dict[str, pd.Series]:
     """Dagelijkse reeksen van K/W, koers/boekwaarde, EV/EBITDA en dividendrendement."""
     slot = markt["slot"].dropna()
@@ -595,7 +696,7 @@ def bereken_waarderingsreeksen(aandeel, markt: pd.DataFrame, info: dict) -> dict
 
     # Kengetallen op basis van jaarcijfers (rapportagevaluta, zo nodig omgerekend)
     try:
-        winst_tabel, balans = aandeel.income_stmt, aandeel.balance_sheet
+        winst_tabel, balans = jaarcijfers(aandeel, getattr(aandeel, "ticker", ""))
     except Exception as fout:  # yfinance geeft uiteenlopende fouttypen
         log.warning("Jaarcijfers mislukt: %s", fout)
         return reeksen
@@ -1343,6 +1444,11 @@ def afgerond(waarde, decimalen: int = 2) -> float | None:
     return round(getal, decimalen) if getal is not None else None
 
 
+def met_basis(info: dict) -> dict:
+    """Bewaart een kopie als 'volledig': het uitgangspunt voor de lichte runs van de dag erna."""
+    return {**info, "volledig": dict(info)}
+
+
 def bereken_koersinfo(markt: pd.DataFrame) -> dict:
     """Slotkoers, vorige slot, dag hoog/laag, 12 maanden hoog/laag en het rendement dit jaar (YTD).
     Op basis van de gewone koersen, zoals op beurssites."""
@@ -1360,6 +1466,7 @@ def bereken_koersinfo(markt: pd.DataFrame) -> dict:
         "hoog_12m": afgerond(jaar["hoog"].max()),
         "laag_12m": afgerond(jaar["laag"].min()),
         "ytd": afgerond(ytd),
+        "datum": slot.index[-1].strftime("%Y-%m-%d"),
     }
 
 
@@ -1419,7 +1526,7 @@ def maak_app_data(rijen_per_index: dict[str, list[dict]]) -> dict:
         "signalen": bepaal_signalen(rijen_per_index),
         "beweging": maak_beweging_data(rijen_per_index),
         "indices": {naam: maak_index_data(rijen) for naam, rijen in rijen_per_index.items() if rijen},
-        "koersinfo": {ticker: bereken_koersinfo(markt) for ticker, markt in KOERSHISTORIE.items()},
+        "koersinfo": {ticker: met_basis(bereken_koersinfo(markt)) for ticker, markt in KOERSHISTORIE.items()},
         "waardering": WAARDERING,
         "toelichting": TOELICHTING.strip(),
     }
@@ -1488,6 +1595,12 @@ def bewaar_uitvoer(rijen_per_index: dict[str, list[dict]]) -> list[str]:
             log.warning("%s opslaan mislukt: %s", naam, fout)
 
     aantal = bewaar_historie(map_pad)
+    try:
+        bewaar_jaarcijfers_cache(map_pad)
+    except Exception as fout:  # de cache mag het opslaan van de rest niet blokkeren
+        log.warning("Jaarcijfers bewaren mislukt: %s", fout)
+    print(f"Jaarcijfers: {_JAARCIJFERS_STAND['opgehaald']} opgehaald bij Yahoo, "
+          f"{_JAARCIJFERS_STAND['uit_cache']} uit de opgeslagen kopie.")
     if not IN_NOTEBOOK:
         print(f"Koersgeschiedenis opgeslagen voor {aantal} aandelen.")
 
@@ -1498,6 +1611,187 @@ def bewaar_uitvoer(rijen_per_index: dict[str, list[dict]]) -> list[str]:
         except Exception as fout:
             log.warning("Downloaden mislukt: %s. Het bestand staat links in Colab onder 'Bestanden'.", fout)
     return paden
+
+
+# =============================================================================
+# 12. LICHTE RUN: ALLEEN DE KOERSEN BIJWERKEN (ELK UUR TIJDENS DE BEURS)
+# =============================================================================
+#
+# De volledige run (1x per dag na sluiting) berekent alles. De lichte run haalt de gegevens
+# van de laatste run op van je eigen website, vraagt bij Yahoo alleen de 5-minutenkoersen op
+# en werkt daarmee de koers, het dagverschil, dag hoog/laag, YTD, de 1D-grafiek en de
+# stijgers/dalers bij. Indicatoren, signalen en waardering blijven die van de laatste
+# volledige run, want die horen bij definitieve slotkoersen.
+
+def haal_site_bestand(pad: str) -> bytes:
+    """Haalt een bestand van je eigen GitHub Pages-website op (niet van Yahoo)."""
+    import urllib.request
+    url = f"{SITE_URL.rstrip('/')}/{pad}?t={int(time.time())}"
+    with urllib.request.urlopen(url, timeout=30) as antwoord:
+        return antwoord.read()
+
+
+def haal_intraday(ticker: str) -> pd.DataFrame | None:
+    """5-minutenkoersen van de laatste beursdagen, in Amsterdamse tijd."""
+    data = yf.download(ticker, period="5d", interval="5m", auto_adjust=False, progress=False)
+    if data.empty:
+        return None
+    dag = pd.DataFrame({
+        "slot": data["Close"].squeeze(),
+        "hoog": data["High"].squeeze(),
+        "laag": data["Low"].squeeze(),
+    }).dropna()
+    if dag.empty:
+        return None
+    if dag.index.tz is None:
+        dag.index = dag.index.tz_localize("UTC")
+    dag.index = dag.index.tz_convert("Europe/Amsterdam")
+    return dag
+
+
+def werk_reeks_bij(reeks: dict, datum: str, koers: float, zelfde_periode) -> None:
+    """Vervangt het laatste punt als het in dezelfde periode valt, anders komt er een punt bij."""
+    datums, koersen = reeks["datums"], reeks["koersen"]
+    if datums and zelfde_periode(datums[-1]):
+        datums[-1], koersen[-1] = datum, round(koers, 2)
+    elif not datums or datum > datums[-1]:
+        datums.append(datum)
+        koersen.append(round(koers, 2))
+
+
+def pas_koers_aan(data: dict, historie: dict, ticker: str, intraday: pd.DataFrame) -> bool:
+    """Werkt koers, dagverschil, koersinfo en grafiekgegevens van één aandeel bij."""
+    info = data["koersinfo"].get(ticker)
+    if not info:
+        return False
+    # 'volledig' bewaart de cijfers van de laatste volledige run; die blijven het uitgangspunt
+    basis = info.get("volledig") or dict(info)
+    if not basis.get("slot"):
+        return False
+    basis_datum = pd.Timestamp(basis["datum"]).date() if basis.get("datum") else None
+
+    vandaag = intraday.index[-1].date()
+    vandaag_koersen = intraday[intraday.index.date == vandaag]
+    laatste = float(vandaag_koersen["slot"].iloc[-1])
+
+    if basis_datum is not None and vandaag < basis_datum:
+        return False  # de volledige run is nieuwer dan deze koersen
+    if basis_datum is None or vandaag > basis_datum:
+        vorige = basis["slot"]           # de slotkoers van de laatste volledige run
+    else:
+        vorige = basis.get("vorige_slot")  # de volledige run had vandaag al meegenomen
+    if not vorige:
+        return False
+
+    ytd = basis.get("ytd")
+    if basis_datum is not None and vandaag.year > basis_datum.year:
+        ytd = (laatste / basis["slot"] - 1) * 100  # nieuw jaar: rekenen vanaf de laatste slotkoers
+    elif ytd is not None:
+        ytd = ((1 + ytd / 100) * laatste / basis["slot"] - 1) * 100
+
+    dag_hoog = float(vandaag_koersen["hoog"].max())
+    dag_laag = float(vandaag_koersen["laag"].min())
+    info.update({
+        "slot": afgerond(laatste),
+        "vorige_slot": afgerond(vorige),
+        "dag_hoog": afgerond(dag_hoog),
+        "dag_laag": afgerond(dag_laag),
+        "hoog_12m": afgerond(max(basis.get("hoog_12m") or dag_hoog, dag_hoog)),
+        "laag_12m": afgerond(min(basis.get("laag_12m") or dag_laag, dag_laag)),
+        "ytd": afgerond(ytd),
+        "datum": vandaag.isoformat(),
+        "volledig": basis,
+    })
+
+    verschil = round((laatste / vorige - 1) * 100, 2)
+    for aandelen in data["indices"].values():
+        for aandeel in aandelen:
+            if aandeel["ticker"] != ticker:
+                continue
+            aandeel["waarden"][KOL_KOERS] = round(laatste, 2)
+            aandeel["waarden"][KOL_DAGVERSCHIL] = verschil
+            kleur = KLEURNAMEN.get(kleur_trend(verschil))
+            if kleur:
+                aandeel["kleuren"][KOL_DAGVERSCHIL] = kleur
+            else:
+                aandeel["kleuren"].pop(KOL_DAGVERSCHIL, None)
+
+    # grafieken: 1D vervangen, het punt van vandaag bij de dag- en weekkoersen
+    datum = vandaag.isoformat()
+    historie["dag"] = reeks_naar_lijst(vandaag_koersen["slot"], "%H:%M")
+    werk_reeks_bij(historie["dagelijks"], datum, laatste, lambda d: d == datum)
+    week = pd.Timestamp(datum).to_period("W-FRI")
+    werk_reeks_bij(historie["wekelijks"], datum, laatste, lambda d: pd.Timestamp(d).to_period("W-FRI") == week)
+    return True
+
+
+def werk_beweging_bij(data: dict) -> None:
+    """Grootste stijgers en dalers opnieuw bepalen met de nieuwe koersen."""
+    rijen_per_index = {
+        index: [{KOL_AANDEEL: a["aandeel"], KOL_TICKER: a["ticker"], KOL_VALUTA: a.get("valuta"),
+                 KOL_KOERS: a["waarden"].get(KOL_KOERS), KOL_DAGVERSCHIL: a["waarden"].get(KOL_DAGVERSCHIL)}
+                for a in aandelen]
+        for index, aandelen in data["indices"].items()
+    }
+    data["beweging"] = maak_beweging_data(rijen_per_index)
+
+
+def lichte_run() -> int:
+    print(f"MalKho-script versie {MALKHO_VERSIE} ({MALKHO_DATUM}): lichte run (alleen koersen)")
+    if not SITE_URL or not UITVOER_MAP:
+        log.error("MALKHO_SITE_URL en MALKHO_UITVOER moeten ingesteld zijn voor de lichte run.")
+        return 1
+    try:
+        data = json.loads(haal_site_bestand(DATA_BESTAND))
+        dashboard = haal_site_bestand("index.html")
+    except Exception as fout:
+        log.error("De gegevens van de vorige run konden niet worden opgehaald (%s). "
+                  "Draai eerst een volledige run.", fout)
+        return 1
+
+    tickers = list(data.get("koersinfo", {}))
+    historie = {}
+    for ticker in tickers:
+        try:
+            historie[ticker] = json.loads(haal_site_bestand(f"{HISTORIE_MAP}/{historie_bestandsnaam(ticker)}"))
+        except Exception as fout:
+            # zonder dit bestand zou het na publiceren van de website verdwijnen: dan liever stoppen
+            log.error("Historie van %s niet op te halen (%s); er wordt niets gepubliceerd.", ticker, fout)
+            return 1
+
+    bijgewerkt = 0
+    for ticker in tickers:
+        try:
+            intraday = haal_intraday(ticker)
+            if intraday is not None and pas_koers_aan(data, historie[ticker], ticker, intraday):
+                bijgewerkt += 1
+        except Exception as fout:  # één aandeel mag de rest niet blokkeren
+            log.warning("Koers bijwerken mislukt voor %s: %s", ticker, fout)
+        time.sleep(LICHT_PAUZE)
+
+    if bijgewerkt:
+        werk_beweging_bij(data)
+        data["koersen_bijgewerkt"] = pd.Timestamp.now(tz="Europe/Amsterdam").isoformat(timespec="minutes")
+    else:
+        log.warning("Geen enkele koers bijgewerkt; de vorige gegevens blijven staan.")
+
+    schrijf_bestand(UITVOER_MAP, DATA_BESTAND, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+    os.makedirs(UITVOER_MAP, exist_ok=True)
+    with open(os.path.join(UITVOER_MAP, "index.html"), "wb") as bestand:
+        bestand.write(dashboard)  # het dashboard wordt alleen bij de volledige run vernieuwd
+    for ticker, inhoud in historie.items():
+        schrijf_bestand(os.path.join(UITVOER_MAP, HISTORIE_MAP), historie_bestandsnaam(ticker),
+                        json.dumps(inhoud, separators=(",", ":")))
+    # de opgeslagen jaarcijfers ongewijzigd meenemen, anders verdwijnen ze bij het publiceren
+    try:
+        cache = haal_site_bestand(CACHE_BESTAND)
+        os.makedirs(os.path.join(UITVOER_MAP, os.path.dirname(CACHE_BESTAND)), exist_ok=True)
+        with open(os.path.join(UITVOER_MAP, CACHE_BESTAND), "wb") as bestand:
+            bestand.write(cache)
+    except Exception:
+        pass  # nog geen opgeslagen jaarcijfers; de volgende volledige run maakt ze aan
+    print(f"Lichte run klaar: {bijgewerkt} van {len(tickers)} koersen bijgewerkt.")
+    return 0
 
 
 # =============================================================================
@@ -1547,4 +1841,4 @@ def main() -> int:
 if IN_NOTEBOOK:
     main()
 elif __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(lichte_run() if MODUS == "licht" else main())
